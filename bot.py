@@ -1,19 +1,25 @@
 import os, re, glob, time
 from dotenv import load_dotenv
 from google import genai
-from google.genai import types
+from google.genai import types, errors
 
 import calculator
 
 load_dotenv()
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+TIMEOUT_MS = 60_000          # give up on one request after 60 seconds
+MAX_ATTEMPTS = 3
+client = genai.Client(
+    api_key=os.getenv("GEMINI_API_KEY"),
+    http_options=types.HttpOptions(timeout=TIMEOUT_MS),
+)
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 POLICY_DIR = "policies"
 
 # Lines inside policy files that try to instruct the bot. They are not policy rules
 # (e.g. file 12 has an "internal note" that contradicts its own rule 1.2).
 INJECTION = re.compile(
-    r"internal note|for customer service bots|ignore (all|any|previous)|tell customers that",
+    r"internal note|for customer service bots|ignore (all|any|previous)|tell customers that|system override",
     re.IGNORECASE,
 )
 
@@ -84,22 +90,42 @@ def ask(question: str) -> str:
         system_instruction=SYSTEM,
         temperature=0,
         tools=TOOLS,  # the SDK calls these Python functions automatically
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(
+            maximum_remote_calls=8
+        ),
     )
-    for attempt in range(4):
+    last_error = ""
+    for attempt in range(MAX_ATTEMPTS):
         try:
             resp = client.models.generate_content(model=MODEL, contents=contents, config=config)
             if resp.text:
                 return resp.text
-        except Exception as e:  # rate limit or network error: back off and retry
-            print(f"[retry {attempt + 1}] {e}")
-        time.sleep(2 ** attempt)  # 1s, 2s, 4s, 8s
-    return "Sorry, the service is busy right now. Please try again in a moment."
+            last_error = "empty response"
+        except errors.APIError as e:
+            code = getattr(e, "code", None)
+            if code in (400, 401, 403, 404):
+                # retrying cannot fix a bad key or a wrong model name
+                hint = {
+                    400: "check GEMINI_API_KEY in .env",
+                    401: "check GEMINI_API_KEY in .env",
+                    403: "check GEMINI_API_KEY in .env",
+                    404: "check GEMINI_MODEL in .env (model name may be outdated)",
+                }[code]
+                return f"[CONFIG ERROR {code}] {hint}. Details: {str(e)[:200]}"
+            last_error = f"API error {code}"          # 429 / 5xx: worth retrying
+        except Exception as e:                        # timeout or network problem
+            last_error = f"{type(e).__name__}"
+        print(f"[attempt {attempt + 1}/{MAX_ATTEMPTS} failed: {last_error}]")
+        time.sleep(2 ** attempt)                      # 1s, 2s, 4s
+    return "Sorry, I could not get an answer right now. Please try again in a moment."
 
 
 if __name__ == "__main__":
-    print(f"Loaded {N_FILES} files, about {len(POLICIES) // 4:,} tokens")
+    print(f"Loaded {N_FILES} files, about {len(POLICIES) // 4:,} tokens, model {MODEL}")
     for name, line in DROPPED:
         print(f"[filtered instruction-like line in {name}] {line}")
     while True:
         q = input("\nAsk: ")
+        start = time.time()
         print(ask(q))
+        print(f"\n({time.time() - start:.1f}s)")
