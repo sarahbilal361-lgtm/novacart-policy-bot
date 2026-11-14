@@ -1,6 +1,22 @@
 import html
+import os
 
 import streamlit as st
+
+# On Community Cloud, keep the API key in App settings > Secrets.
+# Locally, bot.py continues to load the key from the ignored .env file.
+try:
+    cloud_key = st.secrets.get("GEMINI_API_KEY")
+    cloud_model = st.secrets.get("GEMINI_MODEL")
+except Exception:
+    cloud_key = None
+    cloud_model = None
+
+if cloud_key:
+    os.environ["GEMINI_API_KEY"] = str(cloud_key)
+if cloud_model:
+    os.environ["GEMINI_MODEL"] = str(cloud_model)
+
 from bot import ask
 
 st.set_page_config(
